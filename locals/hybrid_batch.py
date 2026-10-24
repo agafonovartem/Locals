@@ -96,7 +96,7 @@ def _reserve(cache, upto: int) -> None:
     which on a 16 GB Mac ran a 21k-token prompt out of GPU memory."""
     for c in cache:
         k = getattr(c, "keys", None)
-        if k is None or not isinstance(c, (BatchKVCache, KVCache)):
+        if k is None or not isinstance(c, (BatchKVCache, KVCache)) or hasattr(c, "window"):  # (a window: bounded)
             continue
         step = getattr(c, "step", 256)
         need = -(-upto // step) * step
@@ -124,7 +124,7 @@ def _wrap_one(kv):
 
 def _only_row(c):
     """A batch-of-one cache layer as a single-stream one, sharing its buffers."""
-    if isinstance(c, BatchKVCache) and c.keys is not None:
+    if type(c) is BatchKVCache and c.keys is not None:  # (a window cache's own extract keeps its positions)
         pad = int(c.left_padding.tolist()[0])
         k = KVCache()
         k.keys, k.values = c.keys[..., pad:c._idx, :], c.values[..., pad:c._idx, :]
@@ -238,6 +238,16 @@ def _merge_layerwise(caches) -> list:
 
 
 _GROWTH_TRIM = os.environ.get("LOCALS_GROWTH_TRIM", "1") != "0"
+# The share of a draft's tokens kept by the length of the lookup's match (how far back the stream matches the earlier
+# occurrence the draft continues), measured on Flint: a bare 3-token match is a coincidence, 40 or more a copy under
+# way (14% kept at 3, 47% at 4-5, 32% at 6-9, 59% at 10-19, 71% at 20-39, 98% from 40, over rewrites, quotes, an
+# agent's thinking and prose); a request learns its own (HybridBatchEngine._draft_width)
+_KEPT_PRIOR = {3: 0.15, 4: 0.4, 6: 0.45, 10: 0.6, 20: 0.75, 40: 0.97}
+
+
+def _match_bucket(m: int) -> int:
+    return 40 if m >= 40 else 20 if m >= 20 else 10 if m >= 10 else 6 if m >= 6 else 4 if m >= 4 else 3
+
 # One request running alone: its forced spans fed in one pass, and prompt-lookup drafts verified in the same
 # pass as the next token (HybridBatchEngine._solo). LOCALS_SOLO=0: one token per step, as with many requests.
 _SOLO = os.environ.get("LOCALS_SOLO", "1") != "0"
@@ -461,6 +471,13 @@ class HybridBatchEngine(BatchEngine):
         self.lm = text_model(model)
         self._prefill_scores = getattr(self.lm, "prefill_scores", PREFILL_SCORES)
         self._prefill_base = getattr(self.lm, "prefill_chunk_tokens", 1024)  # a prompt's chunk where it may be longest
+        self._draft_max = getattr(self.lm, "draft_max", 8)  # the widest prompt-lookup draft
+        # a model whose pass of several tokens costs much more than one (Flint: every token's experts) says what a
+        # pass of n tokens costs against a pipelined step; its drafts are then weighed against that cost (_draft_width)
+        self._draft_costs = getattr(self.lm, "draft_costs", None)
+        self._pass_s: Dict[int, float] = {}  # measured: a solo pass of n tokens (EMA), seconds
+        self._step_s: Optional[float] = None  # measured: a pipelined step of one row (EMA), seconds
+        self._t_step: Optional[float] = None
         # GPU bytes the engine may use (0: no guard). Before a prefill, prompt-cache
         # entries are dropped if the prefill would not fit next to them.
         self.memory_limit = 0
@@ -920,23 +937,31 @@ class HybridBatchEngine(BatchEngine):
     # rejected ones are rewound. Without a span or a draft, the row goes back to the pipelined steps.
 
     def _solo_ok(self, r, cache) -> bool:
+        from .qkv import BatchQuantizedKVCache
+        from .window_cache import WindowBatchKVCache
+
         if not _SOLO or cache is None or getattr(self, "_walk", None) is not None:
             return False
-        if any(type(c) not in (BatchKVCache, ArraysCache) for c in cache):
-            # sliding-window layers (Gemma, Flint) and 8-bit ones (locals/qkv.py) are not rewound, which a draft needs
-            # and a forced span does not: those get their spans in one pass, and no drafts (_solo_drafts_ok)
-            from .qkv import BatchQuantizedKVCache
-
-            if any(type(c) not in (BatchKVCache, ArraysCache, BatchRotatingKVCache, BatchQuantizedKVCache) for c in cache):
-                return False
-            if self._solo_drafts_ok(cache):
-                return False
+        # mlx-lm's sliding-window rings (Gemma) are not rewound, which a draft needs and a forced span does not: a
+        # model with them gets its spans in one pass and no drafts (_solo_drafts_ok)
+        if any(type(c) not in (BatchKVCache, ArraysCache, BatchRotatingKVCache, BatchQuantizedKVCache, WindowBatchKVCache)
+               for c in cache):
+            return False
         name = type(r.controller).__name__
         return name not in ("WalkController", "PDAController")
 
     def _solo_drafts_ok(self, cache) -> bool:
-        """Drafts need the per-token recurrent states the fused Gated DeltaNet kernel records (to rewind)."""
+        """Drafts need every layer rewound: attention layers trim (a window layer in window_cache.WindowBatchKVCache
+        too; mlx-lm's ring cannot), recurrent ones need the per-token states the fused Gated DeltaNet kernel
+        records."""
         from . import fuse
+        from .qkv import BatchQuantizedKVCache
+        from .window_cache import WindowBatchKVCache
+
+        if any(type(c) is BatchRotatingKVCache for c in cache):
+            return False
+        if not any(isinstance(c, ArraysCache) for c in cache):  # attention only (Flint): every layer trims
+            return all(type(c) in (BatchKVCache, WindowBatchKVCache, BatchQuantizedKVCache) for c in cache)
 
         n = getattr(self, "_solo_gdn", None)
         if n is None:  # the fused GDN layers, or 0 when any layer cannot record its states
@@ -971,8 +996,18 @@ class HybridBatchEngine(BatchEngine):
         j = idx.get(tuple(stream[-3:])) if len(stream) >= 3 else None
         if j is None:
             return []
+        m = 3  # how far back the stream matches that earlier occurrence (a long match: a copy under way)
+        while m < 64 and j - m - 1 >= 0 and stream[j - m - 1] == stream[-m - 1]:
+            m += 1
+        r.lk_match = m
         acc = getattr(r, "solo_acc", None) or []
-        width = 4 if not acc else max(1, min(8, int(round(2 * sum(acc[-8:]) / len(acc[-8:]) + 1))))
+        top = self._draft_max
+        if self._draft_costs is not None:
+            width = self._draft_width(r, m, top)
+            if not width:
+                return []
+        else:
+            width = 4 if not acc else max(1, min(top, int(round(2 * sum(acc[-8:]) / len(acc[-8:]) + 1))))
         eos = set(r.controller.eos_ids) or set(self.tokenizer.eos_token_ids)
         draft = stream[j:j + width]
         for i, tok in enumerate(draft):
@@ -990,6 +1025,57 @@ class HybridBatchEngine(BatchEngine):
                     break
             draft = kept if len(kept) >= 2 else []  # one token under a grammar is too often a repeated key's start
         return draft[: max(0, r.max_tokens - len(r.out) - 1)]
+
+    def _note_pass(self, n: int, dt: float) -> None:
+        old = self._pass_s.get(n)
+        if old is None:  # a first pass of n tokens may compile kernels for its shape: at most half again the prior
+            self._pass_s[n] = dt if self._step_s is None else min(dt, 1.5 * self._pass_cost(n))
+        else:
+            self._pass_s[n] = 0.8 * old + 0.2 * min(dt, 3 * old)
+        self._t_step = None  # (the next pipelined step's time would include this pass)
+
+    def _note_step(self) -> None:
+        """A pipelined step of the only row ended: its time since the last one (EMA)."""
+        now = time.perf_counter()
+        if self._t_step is not None:
+            dt = now - self._t_step
+            if self._step_s is None:
+                self._step_s = dt
+            elif dt < 3 * self._step_s:
+                self._step_s = 0.8 * self._step_s + 0.2 * dt
+        self._t_step = now
+
+    def _pass_cost(self, n: int) -> float:
+        """Seconds a solo pass of ``n`` tokens takes: measured, else the model's ratio to a pipelined step."""
+        if n in self._pass_s:
+            return self._pass_s[n]
+        ks = sorted(self._draft_costs)
+        lo = max([k for k in ks if k <= n] or ks[:1])
+        hi = min([k for k in ks if k >= n] or ks[-1:])
+        ratio = self._draft_costs[lo] if hi == lo else (
+            self._draft_costs[lo] + (self._draft_costs[hi] - self._draft_costs[lo]) * (n - lo) / (hi - lo))
+        return ratio * self._step_s
+
+    def _draft_width(self, r, m: int, top: int) -> int:
+        """The draft width that writes the most tokens a second, or 0 when none beats pipelined steps by a tenth:
+        a draft of w is expected to keep the share of its tokens drafts at this match length kept (learned on the
+        request, from _KEPT_PRIOR), plus the token after them; a pass of w + 1 tokens costs _pass_cost."""
+        if self._step_s is None:
+            return 0
+        b = _match_bucket(m)
+        learned = (getattr(r, "kappa", None) or {}).get(b)
+        if learned is not None:
+            kappa = learned
+        else:  # a length not drafted at yet: the prior, or what this request's drafts have kept when that is more
+            kappa = max(_KEPT_PRIOR[b], 0.9 * (getattr(r, "kept_rate", None) or 0.0))
+        best_w, best = 0, 1.1 / self._step_s
+        for w in (1, 3, 7, 11, 15):
+            if w > top:
+                break
+            rate = (1 + kappa * w) / self._pass_cost(w + 1)
+            if rate > best:
+                best_w, best = w, rate
+        return best_w
 
     def _solo_verify(self, logits: mx.array, draft: List[int], temp: float, r=None) -> List[int]:
         """The accepted draft tokens and the token after them. Greedy: draft tokens while each equals the argmax.
@@ -1080,6 +1166,7 @@ class HybridBatchEngine(BatchEngine):
                 if isinstance(c, ArraysCache):
                     c.want_states = bool(draft)
                     c.token_states = None
+            t_pass = time.perf_counter()
             try:
                 h = self.lm.model(mx.array([toks], dtype=mx.int32), cache)
             finally:
@@ -1102,6 +1189,14 @@ class HybridBatchEngine(BatchEngine):
             else:
                 y = self._pick(logits[-1:], gs if constrained else None, t_r, ([r], [r.max_tokens - len(r.out)]))
                 picked, a = [int(y.item())], 0
+            if self._draft_costs is not None:  # (the pass is done: its tokens were read on the host)
+                self._note_pass(len(toks), time.perf_counter() - t_pass)
+                if draft:
+                    b = _match_bucket(getattr(r, "lk_match", 3))
+                    kappa = r.__dict__.setdefault("kappa", {})
+                    kappa[b] = 0.7 * kappa.get(b, _KEPT_PRIOR[b]) + 0.3 * a / len(draft)
+                    r.kept_rate = a / len(draft) if getattr(r, "kept_rate", None) is None else (
+                        0.8 * r.kept_rate + 0.2 * a / len(draft))
             n0 = len(r.out)
             kept = a  # draft tokens that stay in the cache
             nxt = None  # the next token to feed
@@ -1742,8 +1837,12 @@ class HybridBatchEngine(BatchEngine):
                     self._after_commit(r, n0, dead)
             cur, g = nxt, g2
             if _SOLO and len(rows) == 1 and not queue and not filling and not dead and self._solo_ok(rows[0], cache):
+                if self._draft_costs is not None:
+                    self._note_step()
                 # entering costs about a step (the pipeline drains): a forced span of 3 or more tokens, or a draft
                 solo_next = len(rows[0].pend) >= 3 or bool(self._solo_draft(rows[0], cache))
+            else:
+                self._t_step = None
         mx.synchronize()
         self.active = 0
         return BatchStats(time.perf_counter() - t0, prefill_s, steps, nrows, self.tokens_out)

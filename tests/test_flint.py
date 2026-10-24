@@ -259,12 +259,14 @@ def test_patched_flint_decodes_as_the_stock_one():
 @pytest.mark.parametrize("kv_bits", ["16", "8"])
 def test_a_span_in_one_pass_is_its_tokens_one_at_a_time(kv_bits, monkeypatch):
     """One request alone gets a forced span (tool-call syntax, a typed call's parameter names) in one pass
-    (HybridBatchEngine._solo): over Flint's batch caches, sliding-window rings past their window and full-attention
-    layers in bf16 or 8 bits, that pass gives the logits one-token steps give and leaves the caches as they do. No
-    drafts: a rejected draft would need those caches rewound."""
+    (HybridBatchEngine._solo): over Flint's batch caches, sliding-window layers past their window and full-attention
+    layers in bf16 or 8 bits, that pass gives the logits one-token steps give and leaves the caches as they do. Every
+    layer trims (window_cache.py), so drafts are on too."""
     from types import SimpleNamespace
 
-    from mlx_lm.models.cache import BatchRotatingKVCache, make_prompt_cache
+    from mlx_lm.models.cache import make_prompt_cache
+
+    from locals.window_cache import WindowBatchKVCache
 
     import locals
     from locals.hybrid_batch import HybridBatchEngine
@@ -281,7 +283,7 @@ def test_a_span_in_one_pass_is_its_tokens_one_at_a_time(kv_bits, monkeypatch):
         return [x.merge([x]) for x in c]
 
     drip, one = batch_of_one(), batch_of_one()
-    assert any(isinstance(c, BatchRotatingKVCache) for c in one)
+    assert any(isinstance(c, WindowBatchKVCache) for c in one)
     ref = mx.concatenate([m(mx.array([[t]]), cache=drip)[:, -1] for t in span]).astype(mx.float32)
     got = m(mx.array([span]), cache=one)[0].astype(mx.float32)
     assert float(mx.abs(got - ref).max()) <= 0.05 * (1 + float(mx.abs(ref).max()))
@@ -291,7 +293,7 @@ def test_a_span_in_one_pass_is_its_tokens_one_at_a_time(kv_bits, monkeypatch):
     eng = HybridBatchEngine.__new__(HybridBatchEngine)
     eng.lm = SimpleNamespace(model=m)
     r = SimpleNamespace(controller=SimpleNamespace())
-    assert eng._solo_ok(r, one) and not eng._solo_drafts_ok(one)
+    assert eng._solo_ok(r, one) and eng._solo_drafts_ok(one)
 
 
 def test_banded_window_attention_is_the_masked_one(monkeypatch):
@@ -389,3 +391,123 @@ def test_a_pass_of_5_to_8_queries_padded_to_9_attends_as_unpadded(L):
         got = attend_few(q, k, v, 0.09, mask, sinks).astype(mx.float32)
         assert got.shape == ref.shape
         assert float(mx.abs(got - ref).max()) <= 1e-2 * (1 + float(mx.abs(ref).max()))
+
+
+def _decode(model, cache, tokens):
+    return [model(mx.array([[t]]), cache=cache)[0, -1].astype(mx.float32) for t in tokens]
+
+
+def test_window_cache_attends_to_the_window_as_mlx_lms_ring(monkeypatch):
+    """A sliding layer's ring with SLACK slots more than its window, the mask still the window's: the same logits as
+    mlx-lm's ring of the window, far past it (the window here is 9 tokens)."""
+    from mlx_lm.models.cache import make_prompt_cache
+
+    import locals
+    from locals import fuse
+    from locals.window_cache import SLACK, WindowKVCache
+
+    monkeypatch.setattr(fuse, "USE_WINDOW_CACHES", False)
+    stock = _model(seed=5)
+    locals.patch(stock, tune="off", kernels=False)
+    monkeypatch.setattr(fuse, "USE_WINDOW_CACHES", True)
+    ours = _model(seed=5)
+    locals.patch(ours, tune="off", kernels=False)
+    c0, c1 = make_prompt_cache(stock), make_prompt_cache(ours)
+    assert isinstance(c1[1], WindowKVCache) and c1[1].max_size == 9 + SLACK and c1[1].window == 9
+    assert not isinstance(c0[1], WindowKVCache)
+    toks = [int(t) for t in mx.random.randint(0, 512, (100,), key=mx.random.key(1)).tolist()]
+    mx.eval(stock(mx.array([toks[:20]]), cache=c0), ours(mx.array([toks[:20]]), cache=c1))
+    for a, b in zip(_decode(stock, c0, toks[20:]), _decode(ours, c1, toks[20:])):  # past window + SLACK too
+        assert float(mx.abs(a - b).max()) <= 2e-3 * (1 + float(mx.abs(a).max()))
+
+
+def test_window_batch_cache_merges_trims_drops_and_extracts():
+    """Two requests of different lengths in one WindowBatchKVCache: each row decodes as it does alone, a draft fed in
+    one pass and rejected is trimmed away exactly, the oldest slots are dropped as the window moves on (memory stays
+    bounded), and a row taken back out (the prompt cache) goes on as alone."""
+    from mlx_lm.models.cache import make_prompt_cache
+
+    import locals
+    from locals.window_cache import DROP, SLACK, WindowBatchKVCache, WindowKVCache
+
+    m = _model(seed=6)
+    locals.patch(m, tune="off", kernels=False)
+    seqs = [[int(t) for t in mx.random.randint(0, 512, (n,), key=mx.random.key(n)).tolist()] for n in (30, 13)]
+    steps = 9 + SLACK + DROP + 40  # far enough for slots to be dropped
+    singles = []
+    for s in seqs:  # each alone: its prompt, then the decode steps
+        c = make_prompt_cache(m)
+        mx.eval(m(mx.array([s]), cache=c))
+        singles.append((c, _decode(m, c, [t % 512 for t in range(steps)])))
+    rows = []
+    for s in seqs:
+        c = make_prompt_cache(m)
+        mx.eval(m(mx.array([s]), cache=c))
+        rows.append(c)
+    batch = [rows[0][i].merge([r[i] for r in rows]) for i in range(len(rows[0]))]
+    win = batch[1]
+    assert isinstance(win, WindowBatchKVCache) and win.offset.tolist() == [30, 13]
+    most = 0
+    for step in range(steps):
+        if step in (10, 120):  # a 7-token draft verified and rejected: fed in one pass, then trimmed
+            mx.eval(m(mx.random.randint(0, 512, (2, 7), key=mx.random.key(99 + step)), cache=batch))
+            for c in batch:
+                c.trim(7)
+        out = m(mx.array([[step % 512], [step % 512]]), cache=batch)[:, -1].astype(mx.float32)
+        most = max(most, win._idx)
+        for r in range(2):
+            ref = singles[r][1][step]
+            # (a padded row is a few last bits off its own run, with mlx-lm's ring as with this cache)
+            assert float(mx.abs(out[r] - ref).max()) <= 2e-2 * (1 + float(mx.abs(ref).max())), (step, r)
+    assert most <= 9 + SLACK + DROP + 7 and win.offset.tolist() == [30 + steps, 13 + steps]
+    back = [c.extract(1) for c in batch]
+    assert isinstance(back[1], WindowKVCache) and back[1].offset == 13 + steps
+    for x, y in zip(_decode(m, back, [7, 8, 9]), _decode(m, singles[1][0], [7, 8, 9])):
+        assert float(mx.abs(x - y).max()) <= 2e-3 * (1 + float(mx.abs(y).max()))
+
+
+def test_flint_drafts_are_weighed_against_their_cost():
+    """A model that says what its passes cost (Flint's draft_costs) drafts only where the lookup's match makes the
+    draft worth its pass: never at a bare 3-token match, the widest draft (15) in a copy under way, nothing until a
+    pipelined step was timed; a request that keeps its drafts drafts at short matches too, and a first pass of a
+    width (kernels compiling) counts at most half again its prior."""
+    from types import SimpleNamespace
+
+    from locals.hybrid_batch import _KEPT_PRIOR, HybridBatchEngine, _match_bucket
+
+    eng = HybridBatchEngine.__new__(HybridBatchEngine)
+    eng._draft_costs = {1: 1.47, 2: 2.0, 4: 3.0, 8: 4.5, 12: 6.06, 16: 7.03}
+    eng._pass_s, eng._step_s, eng._t_step = {}, None, None
+    r = SimpleNamespace()
+    assert eng._draft_width(r, 50, 15) == 0  # no step timed yet
+    eng._step_s = 0.0087
+    assert [_match_bucket(m) for m in (3, 5, 9, 15, 30, 64)] == [3, 4, 6, 10, 20, 40]
+    assert eng._draft_width(r, 3, 15) == 0 and eng._draft_width(r, 50, 15) == 15 and eng._draft_width(r, 50, 7) == 7
+    assert eng._draft_width(r, 4, 15) == 0  # 40% kept at a 4-token match: a pass of 16 does not pay
+    r.kept_rate = 0.95  # this request's drafts were kept: a match length it has not drafted at borrows that
+    assert eng._draft_width(r, 4, 15) == 15
+    r.kappa = {4: 0.1}  # ... until it has drafted there
+    assert eng._draft_width(r, 4, 15) == 0
+    eng._note_pass(16, 5.0)  # a first pass that compiled kernels: 5 s
+    assert eng._pass_s[16] <= 1.5 * 7.03 * 0.0087 + 1e-9
+    assert _KEPT_PRIOR[40] > 0.9 > _KEPT_PRIOR[3]
+
+
+def test_lookup_match_length_counts_back_from_the_earlier_occurrence():
+    """_solo_draft records how far back the stream matches the earlier occurrence its draft continues (r.lk_match):
+    the policy's signal for a copy under way."""
+    from types import SimpleNamespace
+
+    from locals.hybrid_batch import HybridBatchEngine
+
+    eng = HybridBatchEngine.__new__(HybridBatchEngine)
+    eng._draft_costs, eng._draft_max = None, 8
+    eng._solo_drafts_ok = lambda cache: True
+    eng.tokenizer = SimpleNamespace(eos_token_ids=[0])
+    text = list(range(100, 140))
+    r = SimpleNamespace(controller=SimpleNamespace(eos_ids=[0]), prompt=[1, 2] + text + [7, 8], out=text[:12], max_tokens=100)
+    draft = eng._solo_draft(r, None)
+    assert r.lk_match == 12 and draft == text[12:16]  # the 12 tokens written so far match; the next 4 follow
+    r.out = [9, 9] + text[30:33]  # only the last 3 match (a coincidence)
+    eng._solo_draft(r, None)
+    assert r.lk_match == 3

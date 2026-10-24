@@ -86,7 +86,12 @@ class FusedFlintAttention(nn.Module):
                 k, v = cache.update_and_fetch(k, v)
             if L == 1 and isinstance(mask, mx.array) and _unpadded(cache):
                 mask = None  # one query a row and no row padded: the mask is all true, and costs MLX's attention 40%
-            W = getattr(cache, "max_size", None)  # a sliding window's ring (mlx-lm's RotatingKVCache)
+            W = getattr(cache, "window", None) or getattr(cache, "max_size", None)  # a sliding window (a ring: its size)
+            n = W + L - 1 if isinstance(W, int) else 0
+            if isinstance(mask, mx.array) and _linear_window(cache) and k.shape[2] > n:
+                # a batch's window cache keeps up to window + 128 slots, the oldest beyond every query's window: only
+                # the slots the window can reach go to the attention (the ring's 513, not 641)
+                k, v, mask = k[..., -n:, :], v[..., -n:, :], mask[..., -n:]
             if FLINT_BAND and L >= 2 * FLINT_BAND and isinstance(mask, mx.array) and isinstance(W, int):
                 out = self._banded(q, k, v, mask, cache, W)
             elif getattr(cache, "bits", None) is None:  # (mlx-lm's quantized caches take its own path)
@@ -126,6 +131,7 @@ class FusedFlintAttention(nn.Module):
 
 
 FEW_PAD = os.environ.get("LOCALS_FEW_QUERY_PAD", "1") != "0"
+USE_WINDOW_CACHES = os.environ.get("LOCALS_WINDOW_CACHES", "1") != "0"
 
 
 def attend_few(q: mx.array, k: mx.array, v: mx.array, scale: float, mask, sinks) -> mx.array:
@@ -142,6 +148,12 @@ def attend_few(q: mx.array, k: mx.array, v: mx.array, scale: float, mask, sinks)
     if isinstance(mask, mx.array):
         mask = mx.concatenate([mx.repeat(mask[..., :1, :], pad, axis=-2), mask], axis=-2)
     return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask, sinks=sinks)[:, :, pad:]
+
+
+def _linear_window(cache) -> bool:
+    from .window_cache import WindowBatchKVCache
+
+    return isinstance(cache, WindowBatchKVCache)
 
 
 def _unpadded(cache) -> bool:
@@ -444,9 +456,19 @@ def fuse_model(model) -> int:
         from .qkv import opt_in
 
         opt_in(model)  # full-attention keys and values in 8 bits, as Flint's config asks (locals/qkv.py)
+        if USE_WINDOW_CACHES:
+            from .window_cache import window_caches
+
+            window_caches(model)  # sliding-window layers that can be rewound: drafts for a request running alone
         # no chunk's scores held (hybrid_batch.PREFILL_SCORES), and 2,048-token chunks read 5% faster than 1,024: a
         # prompt goes in 2,048-token chunks to about 30k tokens, 1,024 to about 63k
         model.prefill_scores, model.prefill_chunk_tokens = 1 << 26, 2048
+        # drafts up to 15 tokens: a pass of 16 costs 61 ms against 39 for 8 (the experts are every token's), 3.8 ms a
+        # token when all are kept against 4.9; past 16 tokens the experts go through MLX's gather (76 ms for 17)
+        model.draft_max = 15
+        # what a pass of n tokens costs against a pipelined step (an M4 Pro, 1k tokens in), the engine's prior for
+        # weighing a draft (hybrid_batch._draft_width); a plain attribute, not one of the module's parameters
+        object.__setattr__(model, "draft_costs", {1: 1.47, 2: 2.0, 4: 3.0, 8: 4.5, 12: 6.06, 16: 7.03})
     mx.eval(model.parameters())
     # the projections fused away stay in MLX's buffer cache, which keeps freed buffers for reuse: 2.5 GB of Flint's
     # (its experts' gate and up), which a 24 GB Mac then swapped for
