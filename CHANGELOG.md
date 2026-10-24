@@ -45,6 +45,12 @@
 - One request through the engine attends without the batch caches' mask when no row is padded (all true, and 40% of
   MLX's attention at 30k keys): after a 30k-token prompt Flint writes 63.7 tokens/s instead of 55.9, after 13k 74.5
   instead of 70.1.
+- Flint's passes of 5 to 8 tokens (a typed tool call's forced spans, drafts) are padded to 9 queries in its attention:
+  MLX's attention takes a path twice as slow from 5 to 8 queries (2.1 ms a full layer at 8k keys for 8, 1.2 for 9).
+- Prompt-lookup drafts for Flint, as Qwen3.5 has them: its sliding-window layers in caches that can be rewound
+  (`window_cache.py`), drafts up to 15 tokens, each weighed against its pass's cost (a pass reads every token's
+  experts) by how far back the lookup's match goes. A file rewritten 1.41x faster, a quoted document 1.67x (1.86x
+  sampled); prose and an agent's thinking, where drafts do not pay, are not drafted.
 - MLX 0.32.4 and mlx-lm 0.32.2 in the lock file, as a fresh install gets them.
 
 ## 0.2.1 (2026-10-21)

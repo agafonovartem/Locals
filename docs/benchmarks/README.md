@@ -594,6 +594,19 @@ Locals 139.
 Replies stream without a stall while another long prompt is read: at most 2.8 s, against 9.7 without mixed passes
 (docs/runtime, "Flint").
 
+**Drafts.** One request through the batch engine with prompt-lookup drafts (docs/runtime, "Flint": rewindable window
+caches, each draft weighed against its pass's cost), against the same engine without them (`LOCALS_SOLO=0`):
+
+| Workload | Greedy, tokens/s | Sampled (temperature 1.0, top_p 0.95, top_k 20) |
+|---|---|---|
+| Rewriting a 110-line file with renames | 103.7 → 145.9 (1.41x) | 100.6 → 118.8 (1.18x) |
+| Quoting a 3,000-character document | 101.5 → 169.5 (1.67x) | 91.9 → 170.6 (1.86x) |
+| A `write` tool call (mostly the agent's thinking) | 99.6 → 95.3 | 90.1 → 113.9 |
+| Prose | 105.6 → 99.6; again 112.7 → 111.3, 114.6 → 113.3 | 94.5 → 97.5 |
+
+A pass of several tokens reads each token's experts: 8 tokens take 39 ms, 16 take 61, against 8.7 for a step, so
+drafts pay where most of a draft is kept, a copy under way, and are not made elsewhere.
+
 **Agent tool calls.** Flint as a coding agent's model in the batch engine, one request at a time: six tools shaped
 as OpenCode's (`read` with `filePath`, `offset`, `limit`; `write`; `edit`; `bash` with a required `description`;
 `glob`; `grep`), a system prompt that says to act through them, 12 tasks ("Show me the first 40 lines of
