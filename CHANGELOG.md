@@ -45,7 +45,7 @@
 - One request through the engine attends without the batch caches' mask when no row is padded (all true, and 40% of
   MLX's attention at 30k keys): after a 30k-token prompt Flint writes 63.7 tokens/s instead of 55.9, after 13k 74.5
   instead of 70.1.
-- Flint's passes of 5 to 8 tokens (a typed tool call's forced spans, drafts) are padded to 9 queries in its attention:
+- Flint's passes of 5 to 8 tokens (a typed tool call's forced spans) are padded to 9 queries in its attention:
   MLX's attention takes a path twice as slow from 5 to 8 queries (2.1 ms a full layer at 8k keys for 8, 1.2 for 9).
 - MLX 0.32.4 and mlx-lm 0.32.2 in the lock file, as a fresh install gets them.
 

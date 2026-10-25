@@ -218,7 +218,7 @@ keys) cost about 1%, and stay.
 **Passes of 5 to 8 tokens** (`fuse.attend_few`). MLX's attention runs a one-query kernel up to 4 queries and its matrix
 kernel from 9; from 5 to 8 it takes a path twice as slow as 9: a full-attention layer at 1,024 keys took 306 us for 8
 queries against 159 for 9, at 8,192 keys 2.1 ms against 1.2, a window layer 173 against 96 us. Forced spans of a
-typed tool call (5 or 6 tokens) and drafts hit it in all 49 layers. Such a pass is padded in front to 9 queries: MLX's
+typed tool call (5 or 6 tokens) hit it in all 49 layers. Such a pass is padded in front to 9 queries: MLX's
 causal mask aligns the last query with the last key, so the real queries keep their keys; an array mask gets copies
 of its first row in front; the padding's outputs are dropped. A pass of 8 tokens after 1,024 takes 38.6 ms instead of
 47.2.
