@@ -255,9 +255,8 @@ and every token they keep is one a one-token step would have produced:
   draft there; the span is fed next.
 
 **When.** At a boundary, when one row runs, nothing waits and no prompt is filling (`_solo_ok`: no walk or
-pushdown constraints). Drafts need every layer rewound (`_solo_drafts_ok`): attention layers trim, Flint's window
-layers in `window_cache.WindowBatchKVCache` and its 8-bit ones (`qkv.py`) too; mlx-lm's sliding-window rings
-(Gemma) do not, so such a model gets forced spans in one pass and no drafts. After a chained step, `solo_next` asks for a
+pushdown constraints). Sliding-window caches (Gemma, Flint) and 8-bit ones (`qkv.py`) are not rewound, so those
+models get forced spans in one pass and no drafts (`_solo_drafts_ok`). After a chained step, `solo_next` asks for a
 boundary when the only row has a forced span of 3 or more tokens or a draft: entering costs about one step,
 since the pipeline drains. Without a span or a draft, `_solo` returns and the row goes on in pipelined
 steps. It also returns as soon as `source` yields a request, which then joins as usual.
@@ -265,15 +264,6 @@ steps. It also returns as soon as `source` yields a request, which then joins as
 **Drafts that keep failing.** After a draft rejected outright, the row gets no draft for 1 token, doubling to
 32 while drafts keep failing (`solo_miss`, `solo_resume`); one token under a grammar is too often the start
 of a repeated JSON key, so drafts there need 2 tokens or more.
-
-**Drafts weighed against their cost** (`_draft_width`). A model whose pass of several tokens costs much more than one
-says so in `draft_costs` (a pass of n tokens against a pipelined step; Flint's, from `fuse_model`, whose passes read
-every token's experts); its drafts are then not sized by the rule above. `_solo_draft` records how far back the stream
-matches the earlier occurrence (`lk_match`); the share a draft keeps is learned per request by that length's bucket
-(`_KEPT_PRIOR` until then, or the request's own share, `kept_rate`, when that is more); `_note_pass` and `_note_step`
-time solo passes by their tokens and pipelined steps (a first pass of a width, which may compile kernels, at most half
-again its prior). The width among 1, 3, 7, 11 and 15 (up to the model's `draft_max`) that writes the most tokens a
-second is drafted, if it beats pipelined steps by a tenth; else none.
 
 Measured through the server, one request, Qwen3.5-4B, greedy, the same answers with `LOCALS_SOLO=0` and 1:
 

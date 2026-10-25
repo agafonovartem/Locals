@@ -223,39 +223,6 @@ causal mask aligns the last query with the last key, so the real queries keep th
 of its first row in front; the padding's outputs are dropped. A pass of 8 tokens after 1,024 takes 38.6 ms instead of
 47.2.
 
-**Drafts** (`window_cache.py`; the engine's `_solo`, `_draft_width`). One request alone gets prompt-lookup drafts, as
-Qwen3.5 does: the continuation of the last earlier occurrence of its last 3 tokens, verified in one pass, the rejected
-part rewound. Two things kept them off for Flint:
-
-- Its window layers sat in mlx-lm's rings, which cannot give a token back once full. A `WindowKVCache` keeps 64
-  slots past the window (a request's ring of 577), the attention still the window's (the mask); a batch's
-  `WindowBatchKVCache` is linear, so it trims, and drops its oldest slots 64 at a time (at most 641), its attention
-  sliced to the window's 513 keys. Decoding through them is as fast as through the rings (112.7 and 114.6 tokens/s
-  on prose against 112.8 and 112.3).
-- A pass reads every token's experts, so a wide draft rejected early costs several steps: a pass of 2 tokens took
-  17.5 ms, 8 took 39.2, 16 took 61.2, against 8.7 for a pipelined step (and 76 for 17, where the experts leave
-  Locals's kernels for MLX's gather). Drafts go up to 15 tokens (`draft_max`; a pass of 16 is 3.8 ms a token when
-  all are kept), and each is weighed: the share of a draft kept follows how far back the stream matches the earlier
-  occurrence the draft continues (14% at a bare 3-token match, 47% at 4 or 5, 59% from 10, 71% from 20, 98% from 40,
-  over rewrites, quotes, an agent's thinking and prose), learned per request by that length, a length not yet
-  drafted at taking the request's own share when it is more; a pass's cost and a step's are timed as they run (the
-  model's `draft_costs`, its pass of n tokens against a step, until then). A draft is made at the width that writes
-  the most tokens a second, and only where that beats pipelined steps by a tenth.
-
-One request through the engine, after a short prompt:
-
-| Workload | Greedy, without drafts / with | Sampled (temperature 1.0, top_p 0.95, top_k 20) |
-|---|---|---|
-| Rewriting a 110-line file with renames | 103.7 / 145.9 tokens/s (1.41x) | 100.6 / 118.8 (1.18x) |
-| Quoting a 3,000-character document | 101.5 / 169.5 (1.67x) | 91.9 / 170.6 (1.86x) |
-| A `write` tool call (mostly the agent's thinking) | 99.6 / 95.3 | 90.1 / 113.9 |
-| Prose | 105.6 / 99.6, again 112.7 / 111.3 and 114.6 / 113.3 | 94.5 / 97.5 |
-
-Runs of one setting differ by up to 5%. After a 10,350-token prompt the quote went from 89.6 to 105.1 tokens/s: a
-pass of 16 then takes 114 ms against a 12.8 ms step. A pass of several tokens rounds differently from one-token
-steps, so a greedy reply with drafts can leave the one without them at a near tie (after 70 to 1,239 tokens here);
-it is no less the model's reply.
-
 **Long contexts.** One growing prompt (the package's own source), read 2,048 tokens at a time, one request writing:
 
 | Context | Reading, mlx-lm / Locals | Writing, mlx-lm / Locals | Peak GPU memory, mlx-lm / Locals |
@@ -314,10 +281,14 @@ first; with `--walk`, which large tool sets need, spans go a token a step.
 
 Tried and left out:
 
-- **Drafts under Qwen3.5's rule** (a first draft of 4, then twice the mean kept plus one, up to 8 or 15), before
-  `_draft_width`: a rewrite at 152 tokens/s, but an agent's thinking, where short matches are mostly coincidences,
-  6% slower than without drafts (greedy) and 9% (sampled). MLX's sorted gather for a draft's experts (each read once
-  for the tokens that chose it) instead of Locals's kernels: 40.5 against 39.3 ms a pass of 8.
+- **Prompt-lookup drafts** (`hybrid_batch._solo`), left out: this work keeps to decoding as it is, not speculative.
+  They need the window layers rewound (built and measured: a ring of the window plus 64 slots per request, a linear
+  batch cache dropping its oldest slots 64 at a time, as fast as mlx-lm's rings) and drafts weighed against their
+  pass, which reads every draft token's experts (16 tokens 61 ms, against 8.7 for a step): by how far back the lookup's
+  match goes (14% of a draft kept at a bare 3-token match, 98% from 40 on), one request then wrote a file rewrite 1.41x
+  faster and a quoted document 1.67x (1.86x sampled), prose unchanged; under Qwen3.5's own width rule an agent's
+  thinking was 6% slower. A pass of several tokens rounds differently from one-token steps, so a greedy reply with
+  drafts left the one without them at a near tie.
 - A fused residual add + RMS norm body (`norm_kernel.add_rms`): no faster here either (8.84 against 8.70 ms a step);
   a custom kernel's call costs the CPU more than MLX's two, and the step is as much the CPU's as the GPU's.
 - **The choice inside the expert kernels**, each simdgroup computing its token's top 6 from the logits (one launch a
